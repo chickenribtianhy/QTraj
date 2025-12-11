@@ -13,3 +13,9 @@ For example, to run a simulation of ghz_n40 with $2^{20}$ shots, execute:
 ```bash
 ./main benchmarks/qasm/ghz ghz_n40.qasm results/result.csv 1 20
 ```
+
+To run a batch of simulation of ghz, execute:
+
+```bash
+./main benchmarks/qasm/ghz ghz results/result.csv 1 20
+```
