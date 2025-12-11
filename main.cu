@@ -997,30 +997,41 @@ long long calculate_max_batch_size(int n_qubits)
 
     return max_shots;
 }
-
 int main(int argc, char *argv[])
 {
     using clock = std::chrono::steady_clock;
-    std::string dir_path = "benchmarks/";
-    if (argc < 4)
+
+    // CHANGED: Increased required argc from 4 to 5 to account for the new argument
+    if (argc < 5)
     {
-        std::cerr << "Usage: " << argv[0] << " <prefix> <output_file> <0/1> [optional: log_shots]\n";
+        std::cerr << "Usage: " << argv[0] << " <directory> <prefix> <output_file> <0/1> [optional: log_shots]\n";
         return 1;
     }
-    std::string prefix = argv[1];
-    std::string out_file = argv[2];
-    int show_results = std::stoi(argv[3]);
-    int fixed_log = (argc == 5) ? std::stoi(argv[4]) : -1;
+
+    // CHANGED: Parse directory from argv[1] and shift others
+    std::string dir_path = argv[1];
+    std::string prefix = argv[2];
+    std::string out_file = argv[3];
+    int show_results = std::stoi(argv[4]);
+
+    std::cout << show_results << std::endl;
+
+    // CHANGED: Check for optional argument at index 5 instead of 4
+    int fixed_log = (argc == 6) ? std::stoi(argv[5]) : -1;
+
     if (!fs::exists(dir_path))
     {
-        std::cerr << "Error: Directory not found.\n";
+        std::cerr << "Error: Directory not found: " << dir_path << "\n";
         return 1;
     }
 
     std::vector<fs::path> files;
+
+    // Note: fs::directory_iterator handles paths correctly without manually adding '/'
     for (const auto &e : fs::directory_iterator(dir_path))
         if (e.path().extension() == ".qasm" && e.path().filename().string().find(prefix) == 0)
             files.push_back(e.path());
+
     std::sort(files.begin(), files.end(), [](const fs::path &a, const fs::path &b)
               { int na=extract_n(a.string()), nb=extract_n(b.string()); return na!=nb ? na<nb : a.string()<b.string(); });
 

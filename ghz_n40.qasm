@@ -1,2 +1,1 @@
 Filename,Qubits,TotalRuntime(s)
-ghz_n40.qasm,40,2.26372
