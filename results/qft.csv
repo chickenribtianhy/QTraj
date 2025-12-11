@@ -1,0 +1,11 @@
+Filename,Qubits,TotalRuntime(s)
+qft_n10.qasm,10,0.468482
+qft_n11.qasm,11,0.0737131
+qft_n12.qasm,12,0.089191
+qft_n13.qasm,13,0.108571
+qft_n14.qasm,14,0.133262
+qft_n15.qasm,15,0.16037
+qft_n16.qasm,16,0.64424
+qft_n17.qasm,17,0.277036
+qft_n18.qasm,18,0.546002
+qft_n19.qasm,19,1.54375
