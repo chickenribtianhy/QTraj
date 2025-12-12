@@ -1,4 +1,4 @@
-This repository is a temporary workspace to demonstrate the work completed for CSCI 775.
+This repository is a temporary workspace only for demonstrating the workload completed for CSCI 775.
 
 The general usage is
 
