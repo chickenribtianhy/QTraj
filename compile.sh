@@ -1,0 +1,1 @@
+nvcc -O3 -std=c++17 -arch=sm_80 -Xcompiler -fopenmp main.cu -o main

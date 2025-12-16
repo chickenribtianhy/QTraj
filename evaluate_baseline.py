@@ -15,7 +15,7 @@ METHODS = [
             'matrix_product_state',
             # 'tensor_network'
             ]
-DEFAULT_SHOTS = 1 << 20  # Fallback for non-QFT tasks
+DEFAULT_SHOTS = 1
 TIMEOUT_SECONDS = 60
 # ===============================================
 

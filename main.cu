@@ -1,11 +1,10 @@
 //=============================================================================
-//  trajectories_qasm_cuda_batched_dynamic_v4.cu
-//  - FEATURE: Auto-Detects GPU Memory and optimizes batch size
-//  - OPTIMIZATION: Fused Kernels & Iterators (Low Memory Footprint)
-//  - OPTIMIZATION: Phase-Only tracking (double)
-//  - OPTIMIZATION: Lightweight PRNG (uint64_t)
-//  - LOGIC: Preserves Phase during Pruning
-//  - LOGIC: Applies fmod(phase, 2PI) ONLY during pruning/resampling
+//  trajectories_multi_gpu_complete_v2.cu
+//  - FIX: Corrected variable name mismatch in mcu3 (prob vs prob_flip)
+//  - FEATURE: Added MCX, MCZ, MCP (General Multi-Control Gates)
+//  - OPTIMIZATION: "Fast Path" for <= 64 qubits (uint64_t Map Keys)
+//  - OPTIMIZATION: Vectorized Gather Kernel (8-byte copy)
+//  - STABILITY: Full Object Ownership (No dangling pointers)
 //=============================================================================
 
 #include <iostream>
@@ -23,6 +22,10 @@
 #include <chrono>
 #include <limits>
 #include <filesystem>
+#include <cstring> // for memcpy
+
+// --- OpenMP Includes ---
+#include <omp.h>
 
 // --- CUDA Includes ---
 #include <cuda_runtime.h>
@@ -48,6 +51,7 @@
 
 #define BLOCK_SIZE 256
 #define PRUNE_PROB_THRESHOLD 0
+#define MAX_CONTROLS 16
 
 namespace fs = std::filesystem;
 
@@ -63,6 +67,56 @@ namespace fs = std::filesystem;
             exit(result);                                                                                \
         }                                                                                                \
     }
+
+// ===================================================================
+// == TEMPLATE HELPERS FOR MAP KEYS
+// ===================================================================
+
+template <typename KeyT>
+__host__ KeyT to_key(const uint8_t *ptr, int bytes_len);
+
+template <>
+__host__ uint64_t to_key<uint64_t>(const uint8_t *ptr, int bytes_len)
+{
+    uint64_t k = 0;
+    memcpy(&k, ptr, bytes_len);
+    return k;
+}
+
+template <>
+__host__ std::vector<uint8_t> to_key<std::vector<uint8_t>>(const uint8_t *ptr, int bytes_len)
+{
+    return std::vector<uint8_t>(ptr, ptr + bytes_len);
+}
+
+template <typename KeyT>
+std::string key_to_string(const KeyT &key, int nq);
+
+template <>
+std::string key_to_string<uint64_t>(const uint64_t &key, int nq)
+{
+    std::string s = "";
+    for (int q = 0; q < nq; ++q)
+    {
+        s += ((key >> q) & 1) ? "1" : "0";
+    }
+    std::reverse(s.begin(), s.end());
+    return s;
+}
+
+template <>
+std::string key_to_string<std::vector<uint8_t>>(const std::vector<uint8_t> &key, int nq)
+{
+    std::string s = "";
+    for (int q = 0; q < nq; ++q)
+    {
+        int byte = q / 8;
+        int bit = q % 8;
+        s += ((key[byte] >> bit) & 1) ? "1" : "0";
+    }
+    std::reverse(s.begin(), s.end());
+    return s;
+}
 
 // ===================================================================
 // == LIGHTWEIGHT RANDOM NUMBER GENERATOR
@@ -126,6 +180,7 @@ __global__ void x_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot, i
     set_qubit(row, qubit_index, 1 - cur);
 }
 
+// Standard U3
 __global__ void u3_kernel(uint8_t *data, uint64_t *seeds, double *phases,
                           int num_shots, int num_bytes_per_shot, int qubit_index,
                           double prob_flip,
@@ -148,10 +203,10 @@ __global__ void u3_kernel(uint8_t *data, uint64_t *seeds, double *phases,
     else
         phase_update = (cur_state == 0) ? k00 : k11;
 
-    // [REVERTED] No fmod here. Just accumulate.
     phases[tid] += phase_update;
 }
 
+// Single Control U3
 __global__ void cu3_kernel(uint8_t *data, uint64_t *seeds, double *phases,
                            int num_shots, int num_bytes_per_shot,
                            int control_index, int target_index,
@@ -183,10 +238,55 @@ __global__ void cu3_kernel(uint8_t *data, uint64_t *seeds, double *phases,
     else
         phase_update = (cur_state == 0) ? k00 : k11;
 
-    // [REVERTED] No fmod here. Just accumulate.
     phases[tid] += phase_update;
 }
 
+// --- NEW: GENERAL MULTI-CONTROL U3 KERNEL ---
+// This handles MCX, MCZ, MCP, MCU3
+__global__ void mcu3_kernel(uint8_t *data, uint64_t *seeds, double *phases,
+                            int num_shots, int num_bytes_per_shot,
+                            const int *control_indices, int num_controls, int target_index,
+                            double prob_flip,
+                            double k00, double k01, double k10, double k11)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_shots)
+        return;
+
+    uint8_t *row = data + (size_t)tid * num_bytes_per_shot;
+
+    // Verify all controls
+    bool all_controls_active = true;
+    for (int i = 0; i < num_controls; ++i)
+    {
+        if (get_qubit(row, control_indices[i]) == 0)
+        {
+            all_controls_active = false;
+            break;
+        }
+    }
+
+    if (!all_controls_active)
+        return;
+
+    // Apply U3 logic to Target
+    int cur_state = get_qubit(row, target_index);
+    float r = next_rand(&seeds[tid]);
+
+    int do_flip = (r < prob_flip);
+    int new_state = cur_state ^ do_flip;
+    set_qubit(row, target_index, new_state);
+
+    double phase_update;
+    if (do_flip)
+        phase_update = (cur_state == 0) ? k01 : k10;
+    else
+        phase_update = (cur_state == 0) ? k00 : k11;
+
+    phases[tid] += phase_update;
+}
+
+// 2-Qubit CX
 __global__ void cx_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot,
                           int control_index, int target_index)
 {
@@ -199,6 +299,7 @@ __global__ void cx_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot,
     set_qubit(row, target_index, c ^ t);
 }
 
+// 3-Qubit CCX
 __global__ void ccx_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot,
                            int c1_index, int c2_index, int target_index)
 {
@@ -216,6 +317,7 @@ __global__ void ccx_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot,
     }
 }
 
+// Swap
 __global__ void swap_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot,
                             int idx_a, int idx_b)
 {
@@ -231,6 +333,30 @@ __global__ void swap_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot
     {
         set_qubit(row, idx_a, b);
         set_qubit(row, idx_b, a);
+    }
+}
+
+// Controlled Swap
+__global__ void cswap_kernel(uint8_t *data, int num_shots, int num_bytes_per_shot,
+                             int c_idx, int t1_idx, int t2_idx)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_shots)
+        return;
+
+    uint8_t *row = data + (size_t)tid * num_bytes_per_shot;
+
+    int c = get_qubit(row, c_idx);
+    if (c == 0)
+        return;
+
+    int a = get_qubit(row, t1_idx);
+    int b = get_qubit(row, t2_idx);
+
+    if (a != b)
+    {
+        set_qubit(row, t1_idx, b);
+        set_qubit(row, t2_idx, a);
     }
 }
 
@@ -281,6 +407,27 @@ __global__ void mark_boundaries_kernel(const uint8_t *data, const int *indices, 
     flags[tid] = diff ? 1 : 0;
 }
 
+__global__ void gather_unique_states_kernel(const uint8_t *all_data, uint8_t *unique_data_out,
+                                            const int *unique_indices,
+                                            int num_unique, int num_bytes_per_shot)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_unique)
+        return;
+
+    int src_shot_idx = unique_indices[tid];
+
+    // Cast to uint64_t for faster copy (8 bytes at a time)
+    const uint64_t *src_ptr = (const uint64_t *)(all_data + (size_t)src_shot_idx * num_bytes_per_shot);
+    uint64_t *dst_ptr = (uint64_t *)(unique_data_out + (size_t)tid * num_bytes_per_shot);
+
+    int num_words = num_bytes_per_shot / 8;
+    for (int i = 0; i < num_words; ++i)
+    {
+        dst_ptr[i] = src_ptr[i];
+    }
+}
+
 __global__ void resample_wide_kernel(
     uint8_t *data,
     uint64_t *seeds,
@@ -315,7 +462,6 @@ __global__ void resample_wide_kernel(
         row64[i] = src64[i];
     }
 
-    // [MODIFIED] Restore phase AND apply modulo 2pi here
     phases[tid] = fmod(kept_phases[idx], 2.0 * M_PI);
 }
 
@@ -415,16 +561,10 @@ struct GateOp
 class Trajectories
 {
 public:
-    struct MeasurementStat
-    {
-        std::vector<uint8_t> state;
-        cuDoubleComplex sum_w; // Raw sum
-    };
-
     struct GroupedData
     {
         std::vector<cuDoubleComplex> h_sum_w;
-        std::vector<std::vector<uint8_t>> h_states;
+        std::vector<uint8_t> h_states_flat;
     };
 
     struct PhaseToComplexFunctor
@@ -463,6 +603,9 @@ private:
     uint64_t *d_seeds = nullptr;
     double *d_phases = nullptr;
 
+    // For Multi-control gates
+    int *d_control_indices = nullptr;
+
     dim3 getGridDim() const { return dim3((num_shots + BLOCK_SIZE - 1) / BLOCK_SIZE); }
     dim3 getBlockDim() const { return dim3(BLOCK_SIZE); }
 
@@ -481,9 +624,10 @@ private:
         }
     }
 
+public:
     GroupedData aggregate_results()
     {
-        checkCuda(cudaDeviceSynchronize());
+        // NO SYNC HERE (Thrust syncs internally/stream-orders correctly)
 
         thrust::device_vector<int> d_indices(num_shots);
         thrust::sequence(d_indices.begin(), d_indices.end());
@@ -529,23 +673,26 @@ private:
         res.h_sum_w.resize(num_unique);
         thrust::copy(d_out_weights.begin(), d_out_weights.begin() + num_unique, res.h_sum_w.begin());
 
-        std::vector<int> h_indices(num_unique);
-        thrust::copy(d_out_indices.begin(), d_out_indices.begin() + num_unique, h_indices.begin());
+        uint8_t *d_gathered_states = nullptr;
+        checkCuda(cudaMalloc(&d_gathered_states, (size_t)num_unique * num_bytes_per_shot));
 
-        res.h_states.resize(num_unique);
-        for (int i = 0; i < num_unique; ++i)
-        {
-            res.h_states[i].resize(num_bytes_per_shot);
-            checkCuda(cudaMemcpy(
-                res.h_states[i].data(),
-                d_data + (size_t)h_indices[i] * num_bytes_per_shot,
-                num_bytes_per_shot,
-                cudaMemcpyDeviceToHost));
-        }
+        int gridSize = (num_unique + 255) / 256;
+        gather_unique_states_kernel<<<gridSize, 256>>>(
+            d_data, d_gathered_states,
+            thrust::raw_pointer_cast(d_out_indices.data()),
+            num_unique, num_bytes_per_shot);
+        checkCuda(cudaPeekAtLastError());
+
+        res.h_states_flat.resize((size_t)num_unique * num_bytes_per_shot);
+        checkCuda(cudaMemcpy(res.h_states_flat.data(), d_gathered_states,
+                             (size_t)num_unique * num_bytes_per_shot, cudaMemcpyDeviceToHost));
+
+        checkCuda(cudaFree(d_gathered_states));
 
         return res;
     }
 
+private:
     void prune_and_resample_threshold(double prob_threshold, int batch_id, int gate_step)
     {
         GroupedData gd = aggregate_results();
@@ -580,16 +727,6 @@ private:
             kept_indices.push_back(std::distance(mags_sq.begin(), it));
         }
 
-        // // --- [DEBUG OUTPUT] ---
-        // std::cout << "[DEBUG] Batch " << batch_id << " | Gate " << gate_step
-        //           << " | Sync/Prune:\n"
-        //           << "        Unique States Found: " << unique_states_count << "\n"
-        //           << "        Total Prob Mass:     " << total_mag_sq << "\n"
-        //           << "        Max Single Prob:     " << max_prob << "\n"
-        //           << "        States Kept:         " << kept_indices.size()
-        //           << " (Removed " << (unique_states_count - kept_indices.size()) << ")\n"
-        //           << "-----------------------------------------------------\n";
-
         double sum_kept = 0.0;
         for (size_t idx : kept_indices)
             sum_kept += mags_sq[idx];
@@ -609,9 +746,10 @@ private:
         {
             acc += mags_sq[idx] / sum_kept;
             h_cdf.push_back(acc);
-            h_kept_states_flat.insert(h_kept_states_flat.end(), gd.h_states[idx].begin(), gd.h_states[idx].end());
 
-            // Calculate Phase using atan2
+            const uint8_t *ptr = &gd.h_states_flat[idx * num_bytes_per_shot];
+            h_kept_states_flat.insert(h_kept_states_flat.end(), ptr, ptr + num_bytes_per_shot);
+
             double angle = atan2(gd.h_sum_w[idx].y, gd.h_sum_w[idx].x);
             h_kept_phases.push_back(angle);
         }
@@ -768,6 +906,9 @@ public:
         checkCuda(cudaMalloc(&d_data, data_size));
         checkCuda(cudaMalloc(&d_seeds, seed_size));
         checkCuda(cudaMalloc(&d_phases, phase_size));
+        // Allocate buffer for multi-controls (reused)
+        checkCuda(cudaMalloc(&d_control_indices, MAX_CONTROLS * sizeof(int)));
+
         checkCuda(cudaMemset(d_data, 0, data_size));
 
         init_seed_kernel<<<getGridDim(), getBlockDim()>>>(d_seeds, num_shots, 1234ULL + seed_offset);
@@ -784,6 +925,8 @@ public:
             checkCuda(cudaFree(d_seeds));
         if (d_phases)
             checkCuda(cudaFree(d_phases));
+        if (d_control_indices)
+            checkCuda(cudaFree(d_control_indices));
     }
 
     // --- GATE IMPLEMENTATIONS ---
@@ -830,6 +973,34 @@ public:
         checkCuda(cudaPeekAtLastError());
     }
 
+    // --- NEW: GENERAL MULTI-CONTROL IMPLEMENTATION ---
+    void mcu3(const std::vector<int> &controls, int target, double theta, double phi, double lambda)
+    {
+        if (controls.size() > MAX_CONTROLS)
+        {
+            throw std::runtime_error("Error: Too many controls for mcu3 (Max " + std::to_string(MAX_CONTROLS) + ")");
+        }
+
+        // Copy control indices to device buffer
+        checkCuda(cudaMemcpy(d_control_indices, controls.data(), controls.size() * sizeof(int), cudaMemcpyHostToDevice));
+
+        double half = theta / 2.0;
+        double cos_v = cos(half);
+        double sin_v = sin(half);
+        double prob = fabs(sin_v) / (fabs(cos_v) + fabs(sin_v));
+
+        double k00 = (cos_v >= 0) ? 0.0 : M_PI;
+        double k01 = phi + ((sin_v >= 0) ? 0.0 : M_PI);
+        double k10 = lambda + ((sin_v >= 0) ? M_PI : 0.0);
+        double k11 = (phi + lambda) + ((cos_v >= 0) ? 0.0 : M_PI);
+
+        mcu3_kernel<<<getGridDim(), getBlockDim()>>>(
+            d_data, d_seeds, d_phases, num_shots, num_bytes_per_shot,
+            d_control_indices, (int)controls.size(), target,
+            prob, k00, k01, k10, k11);
+        checkCuda(cudaPeekAtLastError());
+    }
+
     void ccx(int c1, int c2, int t)
     {
         ccx_kernel<<<getGridDim(), getBlockDim()>>>(d_data, num_shots, num_bytes_per_shot, c1, c2, t);
@@ -839,6 +1010,12 @@ public:
     void swap(int a, int b)
     {
         swap_kernel<<<getGridDim(), getBlockDim()>>>(d_data, num_shots, num_bytes_per_shot, a, b);
+        checkCuda(cudaPeekAtLastError());
+    }
+
+    void cswap(int c, int t1, int t2)
+    {
+        cswap_kernel<<<getGridDim(), getBlockDim()>>>(d_data, num_shots, num_bytes_per_shot, c, t1, t2);
         checkCuda(cudaPeekAtLastError());
     }
 
@@ -863,21 +1040,31 @@ public:
     void cp(int c, int t, double lambda) { this->cu3(c, t, 0.0, 0.0, lambda); }
     void crz(int c, int t, double lambda) { this->cu3(c, t, 0.0, 0.0, lambda); }
 
-    std::vector<MeasurementStat> measure_stats()
+    // -- Multi-Control Wrappers --
+    void mcx(const std::vector<int> &controls, int target)
     {
-        GroupedData gd = aggregate_results();
+        // MCX is just Multi-Control U3(pi, 0, pi)
+        // Or simpler: Multi-Control U3(pi/2, -pi/2, pi/2) for SX, or similar for X.
+        // Standard X via U3 is theta=pi, phi=0, lambda=pi.
+        this->mcu3(controls, target, M_PI, 0.0, M_PI);
+    }
 
-        std::vector<MeasurementStat> out;
-        out.reserve(gd.h_sum_w.size());
+    void mcz(const std::vector<int> &controls, int target)
+    {
+        // Z is U3(0, 0, pi)
+        this->mcu3(controls, target, 0.0, 0.0, M_PI);
+    }
 
-        for (size_t i = 0; i < gd.h_sum_w.size(); ++i)
-        {
-            MeasurementStat st;
-            st.state = gd.h_states[i];
-            st.sum_w = gd.h_sum_w[i];
-            out.push_back(st);
-        }
-        return out;
+    void mcp(const std::vector<int> &controls, int target, double lambda)
+    {
+        // P(lambda) is U3(0, 0, lambda)
+        this->mcu3(controls, target, 0.0, 0.0, lambda);
+    }
+
+    void mcrz(const std::vector<int> &controls, int target, double lambda)
+    {
+        // RZ(lambda) is U3(0, 0, lambda) - same as P up to global phase
+        this->mcu3(controls, target, 0.0, 0.0, lambda);
     }
 
     void run_ops(const std::vector<GateOp> &ops, int batch_id)
@@ -945,6 +1132,31 @@ public:
             // -- Three Qubit --
             else if (op.type == "ccx")
                 ccx(op.qubits[0], op.qubits[1], op.qubits[2]);
+            else if (op.type == "cswap")
+                cswap(op.qubits[0], op.qubits[1], op.qubits[2]);
+
+            // -- Multi-Control Gates --
+            else if (op.type == "mcx" || op.type == "mcx_gray")
+            {
+                // controls are all but last
+                std::vector<int> ctrls(op.qubits.begin(), op.qubits.end() - 1);
+                mcx(ctrls, op.qubits.back());
+            }
+            else if (op.type == "mcz")
+            {
+                std::vector<int> ctrls(op.qubits.begin(), op.qubits.end() - 1);
+                mcz(ctrls, op.qubits.back());
+            }
+            else if (op.type == "mcp" || op.type == "mcu1")
+            {
+                std::vector<int> ctrls(op.qubits.begin(), op.qubits.end() - 1);
+                mcp(ctrls, op.qubits.back(), op.params[0]);
+            }
+            else if (op.type == "mcu3")
+            {
+                std::vector<int> ctrls(op.qubits.begin(), op.qubits.end() - 1);
+                mcu3(ctrls, op.qubits.back(), op.params[0], op.params[1], op.params[2]);
+            }
 
             else
                 executed = false;
@@ -977,47 +1189,211 @@ long long calculate_max_batch_size(int n_qubits)
     cudaError_t err = cudaMemGetInfo(&free_mem, &total_mem);
     if (err != cudaSuccess)
     {
-        std::cerr << "Warning: Failed to get GPU memory info. Using default safe fallback.\n";
-        return 1 << 20; // 1 Million default
+        return 1 << 25; // Fallback
     }
 
+    // 1. State Vector (Aligned)
     int bytes_per_state = ((n_qubits + 7) / 8);
-    bytes_per_state = ((bytes_per_state + 7) / 8) * 8; // Align to 8 bytes
+    bytes_per_state = ((bytes_per_state + 7) / 8) * 8;
 
-    int persistent_overhead = 16;
-    int transient_overhead = 64;
+    // 2. Persistent (Seeds 8B + Phases 8B + Controls)
+    int persistent_overhead = 16 + (MAX_CONTROLS * 4);
+
+    // 3. Transient Overhead (Reduction/Sorting)
+    int transient_overhead = 32;
 
     int bytes_per_shot = bytes_per_state + persistent_overhead + transient_overhead;
 
-    size_t usable_mem = (size_t)(free_mem * 0.90);
+    // 4. Usage Target
+    size_t usable_mem = (size_t)(free_mem * 0.95);
+
     long long max_shots = usable_mem / bytes_per_shot;
 
-    if (max_shots < 1000)
-        max_shots = 1000;
+    // Safety clamp (min 100k shots)
+    if (max_shots < 100000)
+        max_shots = 100000;
 
     return max_shots;
 }
-int main(int argc, char *argv[])
+
+// ===================================================================
+// == TEMPLATED SIMULATION LOOP
+// ===================================================================
+template <typename KeyType>
+void run_simulation(
+    const std::string &sname,
+    int nq,
+    const std::vector<GateOp> &ops,
+    long long total_requested_shots,
+    int num_devices,
+    int show_results,
+    std::ofstream &outfile)
 {
     using clock = std::chrono::steady_clock;
+    int num_bytes_per_shot = (((nq + 7) / 8 + 7) / 8) * 8;
 
-    // CHANGED: Increased required argc from 4 to 5 to account for the new argument
+    std::map<KeyType, cuDoubleComplex> global_results;
+
+// --- WARM UP GPUS BEFORE TIMING START ---
+#pragma omp parallel num_threads(num_devices)
+    {
+        int dev_id = omp_get_thread_num();
+        checkCuda(cudaSetDevice(dev_id));
+        cudaFree(0);
+    }
+
+    // --- START TIMING AFTER WARM UP ---
+    auto t0 = clock::now();
+
+#pragma omp parallel num_threads(num_devices)
+    {
+        int dev_id = omp_get_thread_num();
+        checkCuda(cudaSetDevice(dev_id));
+
+        long long shots_per_device = total_requested_shots / num_devices;
+        long long my_shots = shots_per_device;
+        if (dev_id == num_devices - 1)
+        {
+            my_shots += (total_requested_shots % num_devices);
+        }
+
+        if (my_shots > 0)
+        {
+            long long max_gpu_shots = calculate_max_batch_size(nq);
+            int batch_size = std::min(max_gpu_shots, my_shots);
+            long long num_batches = (my_shots + batch_size - 1) / batch_size;
+
+#pragma omp critical
+            {
+                std::cout << "    [GPU " << dev_id << "] Target Shots: " << my_shots
+                          << " | Batches: " << num_batches
+                          << " | Batch Size: " << batch_size << "\n";
+            }
+
+            // Local aggregation map
+            std::map<KeyType, cuDoubleComplex> local_results;
+
+            for (long long b = 0; b < num_batches; ++b)
+            {
+                int current_shots = batch_size;
+                if (b == num_batches - 1)
+                    current_shots = my_shots - (long long)b * batch_size;
+                if (current_shots <= 0)
+                    break;
+
+                uint64_t global_offset = ((uint64_t)dev_id * shots_per_device) + ((uint64_t)b * batch_size);
+
+                Trajectories circ(nq, current_shots, global_offset);
+                circ.run_ops(ops, (int)b);
+
+                // Keep ownership of memory by returning the full object
+                auto gd = circ.aggregate_results();
+
+                size_t num_unique = gd.h_sum_w.size();
+                for (size_t i = 0; i < num_unique; ++i)
+                {
+                    const uint8_t *ptr = &gd.h_states_flat[i * num_bytes_per_shot];
+
+                    // Use helper to create fast key
+                    KeyType key = to_key<KeyType>(ptr, num_bytes_per_shot);
+
+                    cuDoubleComplex &w = local_results[key];
+                    w = make_cuDoubleComplex(w.x + gd.h_sum_w[i].x, w.y + gd.h_sum_w[i].y);
+                }
+            }
+
+#pragma omp critical
+            {
+                for (auto const &[state, val] : local_results)
+                {
+                    cuDoubleComplex &global_w = global_results[state];
+                    global_w = make_cuDoubleComplex(global_w.x + val.x, global_w.y + val.y);
+                }
+            }
+        }
+    }
+
+    double dur = std::chrono::duration<double>(clock::now() - t0).count();
+
+    if (show_results)
+    {
+        double total_mag_sq = 0.0;
+        for (const auto &kv : global_results)
+        {
+            double mag = cuCabs(kv.second);
+            total_mag_sq += mag * mag;
+        }
+
+        struct FinalRes
+        {
+            KeyType state;
+            double prob;
+            cuDoubleComplex avg_w;
+            std::string ket_str;
+        };
+
+        std::vector<FinalRes> final_kept;
+        double norm = sqrt(total_mag_sq);
+
+        for (const auto &kv : global_results)
+        {
+            double mag = cuCabs(kv.second);
+            double prob = (total_mag_sq > 0) ? (mag * mag) / total_mag_sq : 0.0;
+
+            if (prob >= 1e-4)
+            {
+                FinalRes r;
+                r.state = kv.first;
+                r.prob = prob;
+                r.avg_w = make_cuDoubleComplex(kv.second.x / norm, kv.second.y / norm);
+
+                // Helper to print correct bits
+                r.ket_str = key_to_string(r.state, nq);
+
+                final_kept.push_back(r);
+            }
+        }
+
+        std::sort(final_kept.begin(), final_kept.end(), [](const FinalRes &a, const FinalRes &b)
+                  { return a.ket_str < b.ket_str; });
+
+        std::cout << "\n    --- Results (" << global_results.size() << " unique states) ---\n";
+        for (const auto &item : final_kept)
+        {
+            std::cout << "    |" << item.ket_str << ">: Prob=" << item.prob << " NormalizedW=";
+            print_complex_res(item.avg_w);
+            std::cout << "\n";
+        }
+    }
+
+    std::cout << "    Done (" << dur << " s)\n";
+    outfile << sname << "," << nq << "," << dur << "\n";
+    outfile.flush();
+}
+
+int main(int argc, char *argv[])
+{
     if (argc < 5)
     {
         std::cerr << "Usage: " << argv[0] << " <directory> <prefix> <output_file> <0/1> [optional: log_shots]\n";
         return 1;
     }
 
-    // CHANGED: Parse directory from argv[1] and shift others
     std::string dir_path = argv[1];
     std::string prefix = argv[2];
     std::string out_file = argv[3];
     int show_results = std::stoi(argv[4]);
-
-    std::cout << show_results << std::endl;
-
-    // CHANGED: Check for optional argument at index 5 instead of 4
     int fixed_log = (argc == 6) ? std::stoi(argv[5]) : -1;
+
+    // --- DETECT GPUS ---
+    int num_devices = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if (err != cudaSuccess || num_devices == 0)
+    {
+        std::cerr << "Error: No CUDA devices found.\n";
+        return 1;
+    }
+    std::cout << ">>> Detected " << num_devices << " GPU(s).\n";
 
     if (!fs::exists(dir_path))
     {
@@ -1027,7 +1403,6 @@ int main(int argc, char *argv[])
 
     std::vector<fs::path> files;
 
-    // Note: fs::directory_iterator handles paths correctly without manually adding '/'
     for (const auto &e : fs::directory_iterator(dir_path))
         if (e.path().extension() == ".qasm" && e.path().filename().string().find(prefix) == 0)
             files.push_back(e.path());
@@ -1041,108 +1416,25 @@ int main(int argc, char *argv[])
     for (const auto &fpath : files)
     {
         std::string fname = fpath.string(), sname = fpath.filename().string();
-        std::cout << ">>> Benchmarking: " << sname << " ... \n";
         try
         {
             std::map<std::string, int> tm;
             int nq = 0;
             auto ops = Trajectories::parse_qasm_to_ops(fname, tm, nq);
-
             long long total_requested_shots = (fixed_log != -1) ? (1LL << fixed_log) : (1LL << std::min(30, nq + 5));
-            long long max_gpu_shots = calculate_max_batch_size(nq);
-            int batch_size = std::min(max_gpu_shots, total_requested_shots);
-            long long num_batches = (total_requested_shots + batch_size - 1) / batch_size;
 
-            std::cout << "    Batches: " << num_batches << " | Batch Size: " << batch_size << " | Max GPU Capacity: " << max_gpu_shots << "\n";
+            std::cout << ">>> Benchmarking: " << sname << " (Qubits: " << nq << ")\n";
 
-            std::map<std::vector<uint8_t>, cuDoubleComplex> global_results;
-
-            auto t0 = clock::now();
-
-            for (long long b = 0; b < num_batches; ++b)
+            if (nq <= 64)
             {
-                int current_shots = batch_size;
-                if (b == num_batches - 1)
-                {
-                    current_shots = total_requested_shots - (long long)b * batch_size;
-                }
-
-                if (current_shots <= 0)
-                    break;
-
-                {
-                    uint64_t seed_offset = (uint64_t)b * batch_size;
-                    Trajectories circ(nq, current_shots, seed_offset);
-
-                    circ.run_ops(ops, (int)b);
-
-                    auto batch_stats = circ.measure_stats();
-
-                    for (const auto &s : batch_stats)
-                    {
-                        cuDoubleComplex &global_w = global_results[s.state];
-                        global_w = make_cuDoubleComplex(global_w.x + s.sum_w.x, global_w.y + s.sum_w.y);
-                    }
-                }
+                // FAST PATH: Map Key = uint64_t
+                run_simulation<uint64_t>(sname, nq, ops, total_requested_shots, num_devices, show_results, outfile);
             }
-
-            double dur = std::chrono::duration<double>(clock::now() - t0).count();
-
-            if (show_results)
+            else
             {
-                double total_mag_sq = 0.0;
-                for (const auto &kv : global_results)
-                {
-                    double mag = cuCabs(kv.second);
-                    total_mag_sq += mag * mag;
-                }
-
-                struct FinalRes
-                {
-                    std::vector<uint8_t> state;
-                    double prob;
-                    cuDoubleComplex avg_w;
-                };
-
-                std::vector<FinalRes> final_kept;
-                double norm = sqrt(total_mag_sq);
-
-                for (const auto &kv : global_results)
-                {
-                    double mag = cuCabs(kv.second);
-                    double prob = (total_mag_sq > 0) ? (mag * mag) / total_mag_sq : 0.0;
-                    if (prob >= 1e-4)
-                    {
-                        FinalRes r;
-                        r.state = kv.first;
-                        r.prob = prob;
-                        r.avg_w = make_cuDoubleComplex(kv.second.x / norm, kv.second.y / norm);
-                        final_kept.push_back(r);
-                    }
-                }
-
-                std::sort(final_kept.begin(), final_kept.end(), [](auto &a, auto &b)
-                          { return a.prob > b.prob; });
-
-                std::cout << "\n    --- Results ---\n";
-                for (size_t i = 0; i < std::min((size_t)10, final_kept.size()); ++i)
-                {
-                    std::string ket_str = "";
-                    for (int q = 0; q < nq; ++q)
-                    {
-                        int byte = q / 8;
-                        int bit = q % 8;
-                        ket_str += ((final_kept[i].state[byte] >> bit) & 1) ? "1" : "0";
-                    }
-                    std::reverse(ket_str.begin(), ket_str.end());
-                    std::cout << "    |" << ket_str << ">: Prob=" << final_kept[i].prob << " NormalizedW=";
-                    print_complex_res(final_kept[i].avg_w);
-                    std::cout << "\n";
-                }
+                // GENERIC PATH: Map Key = vector<uint8_t>
+                run_simulation<std::vector<uint8_t>>(sname, nq, ops, total_requested_shots, num_devices, show_results, outfile);
             }
-            std::cout << "    Done (" << dur << " s)\n";
-            outfile << sname << "," << nq << "," << dur << "\n";
-            outfile.flush();
         }
         catch (const std::exception &e)
         {
